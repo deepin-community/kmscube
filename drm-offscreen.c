@@ -21,65 +21,30 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#include <assert.h>
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
+#include <unistd.h>
 
 #include "common.h"
 #include "drm-common.h"
 
 static struct drm drm;
 
-static void page_flip_handler(int fd, unsigned int frame,
-		  unsigned int sec, unsigned int usec, void *data)
+static int offscreen_run(const struct gbm *gbm, const struct egl *egl)
 {
-	/* suppress 'unused parameter' warnings */
-	(void)fd, (void)frame, (void)sec, (void)usec;
-
-	int *waiting_for_flip = data;
-	*waiting_for_flip = 0;
-}
-
-static int legacy_run(const struct gbm *gbm, const struct egl *egl)
-{
-	fd_set fds;
-	drmEventContext evctx = {
-			.version = 2,
-			.page_flip_handler = page_flip_handler,
-	};
-	struct gbm_bo *bo;
-	struct drm_fb *fb;
+	struct gbm_bo *bo = NULL;
 	uint32_t i = 0;
 	int64_t start_time, report_time, cur_time;
-	int ret;
-
-	if (gbm->surface) {
-		eglSwapBuffers(egl->display, egl->surface);
-		bo = gbm_surface_lock_front_buffer(gbm->surface);
-	} else {
-		bo = gbm->bos[0];
-	}
-	fb = drm_fb_get_from_bo(bo);
-	if (!fb) {
-		fprintf(stderr, "Failed to get a new framebuffer BO\n");
-		return -1;
-	}
-
-	/* set mode: */
-	ret = drmModeSetCrtc(drm.fd, drm.crtc_id, fb->fb_id, 0, 0,
-			&drm.connector_id, 1, drm.mode);
-	if (ret) {
-		printf("failed to set mode: %s\n", strerror(errno));
-		return ret;
-	}
 
 	start_time = report_time = get_time_ns();
 
 	while (i < drm.count) {
 		unsigned frame = i;
 		struct gbm_bo *next_bo;
-		int waiting_for_flip = 1;
 
 		/* Start fps measuring on second frame, to remove the time spent
 		 * compiling shader, etc, from the fps:
@@ -101,41 +66,9 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 			glFinish();
 			next_bo = gbm->bos[frame % NUM_BUFFERS];
 		}
-		fb = drm_fb_get_from_bo(next_bo);
-		if (!fb) {
-			fprintf(stderr, "Failed to get a new framebuffer BO\n");
+		if (!next_bo) {
+			printf("Failed to lock frontbuffer\n");
 			return -1;
-		}
-
-		/*
-		 * Here you could also update drm plane layers if you want
-		 * hw composition
-		 */
-
-		ret = drmModePageFlip(drm.fd, drm.crtc_id, fb->fb_id,
-				DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
-		if (ret) {
-			printf("failed to queue page flip: %s\n", strerror(errno));
-			return -1;
-		}
-
-		while (waiting_for_flip) {
-			FD_ZERO(&fds);
-			FD_SET(0, &fds);
-			FD_SET(drm.fd, &fds);
-
-			ret = select(drm.fd + 1, &fds, NULL, NULL, NULL);
-			if (ret < 0) {
-				printf("select err: %s\n", strerror(errno));
-				return ret;
-			} else if (ret == 0) {
-				printf("select timeout!\n");
-				return -1;
-			} else if (FD_ISSET(0, &fds) && !drm.nonblocking) {
-				printf("user interrupted!\n");
-				return 0;
-			}
-			drmHandleEvent(drm.fd, &evctx);
 		}
 
 		cur_time = get_time_ns();
@@ -149,9 +82,8 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 		}
 
 		/* release last buffer to render on again: */
-		if (gbm->surface) {
+		if (bo && gbm->surface)
 			gbm_surface_release_buffer(gbm->surface, bo);
-		}
 		bo = next_bo;
 	}
 
@@ -169,16 +101,15 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 	return 0;
 }
 
-const struct drm * init_drm_legacy(const char *device, const char *mode_str,
-		int connector_id, unsigned int vrefresh, unsigned int count, bool nonblocking)
+const struct drm * init_drm_offscreen(const char *device, const char *mode_str, unsigned int count)
 {
 	int ret;
 
-	ret = init_drm(&drm, device, mode_str, connector_id, vrefresh, count, nonblocking);
+	ret = init_drm_render(&drm, device, mode_str, count);
 	if (ret)
 		return NULL;
 
-	drm.run = legacy_run;
+	drm.run = offscreen_run;
 
 	return &drm;
 }
