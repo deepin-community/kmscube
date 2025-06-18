@@ -32,6 +32,9 @@
 #include "common.h"
 #include "drm-common.h"
 
+WEAK union gbm_bo_handle
+gbm_bo_get_handle_for_plane(struct gbm_bo *bo, int plane);
+
 WEAK uint64_t
 gbm_bo_get_modifier(struct gbm_bo *bo);
 
@@ -75,20 +78,21 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 	height = gbm_bo_get_height(bo);
 	format = gbm_bo_get_format(bo);
 
-	if (gbm_bo_get_modifier && gbm_bo_get_plane_count &&
-	    gbm_bo_get_stride_for_plane && gbm_bo_get_offset) {
+	if (gbm_bo_get_handle_for_plane && gbm_bo_get_modifier &&
+	    gbm_bo_get_plane_count && gbm_bo_get_stride_for_plane &&
+	    gbm_bo_get_offset) {
 
 		uint64_t modifiers[4] = {0};
 		modifiers[0] = gbm_bo_get_modifier(bo);
 		const int num_planes = gbm_bo_get_plane_count(bo);
 		for (int i = 0; i < num_planes; i++) {
+			handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
 			strides[i] = gbm_bo_get_stride_for_plane(bo, i);
-			handles[i] = gbm_bo_get_handle(bo).u32;
 			offsets[i] = gbm_bo_get_offset(bo, i);
 			modifiers[i] = modifiers[0];
 		}
 
-		if (modifiers[0]) {
+		if (modifiers[0] && modifiers[0] != DRM_FORMAT_MOD_INVALID) {
 			flags = DRM_MODE_FB_MODIFIERS;
 			printf("Using modifier %" PRIx64 "\n", modifiers[0]);
 		}
@@ -120,7 +124,7 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 	return fb;
 }
 
-static uint32_t find_crtc_for_encoder(const drmModeRes *resources,
+static int32_t find_crtc_for_encoder(const drmModeRes *resources,
 		const drmModeEncoder *encoder) {
 	int i;
 
@@ -139,7 +143,7 @@ static uint32_t find_crtc_for_encoder(const drmModeRes *resources,
 	return -1;
 }
 
-static uint32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
+static int32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
 		const drmModeConnector *connector) {
 	int i;
 
@@ -148,7 +152,7 @@ static uint32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes 
 		drmModeEncoder *encoder = drmModeGetEncoder(drm->fd, encoder_id);
 
 		if (encoder) {
-			const uint32_t crtc_id = find_crtc_for_encoder(resources, encoder);
+			const int32_t crtc_id = find_crtc_for_encoder(resources, encoder);
 
 			drmModeFreeEncoder(encoder);
 			if (crtc_id != 0) {
@@ -170,6 +174,32 @@ static int get_resources(int fd, drmModeRes **resources)
 }
 
 #define MAX_DRM_DEVICES 64
+
+static int find_drm_render_device(void)
+{
+	drmDevicePtr devices[MAX_DRM_DEVICES] = { NULL };
+	int num_devices, fd = -1;
+
+	num_devices = drmGetDevices2(0, devices, MAX_DRM_DEVICES);
+	if (num_devices < 0) {
+		printf("drmGetDevices2 failed: %s\n", strerror(-num_devices));
+		return -1;
+	}
+
+	for (int i = 0; i < num_devices && fd < 0; i++) {
+		drmDevicePtr device = devices[i];
+
+		if (!(device->available_nodes & (1 << DRM_NODE_RENDER)))
+			continue;
+		fd = open(device->nodes[DRM_NODE_RENDER], O_RDWR);
+	}
+	drmFreeDevices(devices, num_devices);
+
+	if (fd < 0)
+		printf("no drm device found!\n");
+
+	return fd;
+}
 
 static int find_drm_device(drmModeRes **resources)
 {
@@ -208,8 +238,39 @@ static int find_drm_device(drmModeRes **resources)
 	return fd;
 }
 
+static drmModeConnector * find_drm_connector(int fd, drmModeRes *resources,
+						int connector_id)
+{
+	drmModeConnector *connector = NULL;
+	int i;
+
+	if (connector_id >= 0) {
+		if (connector_id >= resources->count_connectors)
+			return NULL;
+
+		connector = drmModeGetConnector(fd, resources->connectors[connector_id]);
+		if (connector && connector->connection == DRM_MODE_CONNECTED)
+			return connector;
+
+		drmModeFreeConnector(connector);
+		return NULL;
+	}
+
+	for (i = 0; i < resources->count_connectors; i++) {
+		connector = drmModeGetConnector(fd, resources->connectors[i]);
+		if (connector && connector->connection == DRM_MODE_CONNECTED) {
+			/* it's connected, let's use this! */
+			break;
+		}
+		drmModeFreeConnector(connector);
+		connector = NULL;
+	}
+
+	return connector;
+}
+
 int init_drm(struct drm *drm, const char *device, const char *mode_str,
-		unsigned int vrefresh, unsigned int count)
+		int connector_id, unsigned int vrefresh, unsigned int count, bool nonblocking)
 {
 	drmModeRes *resources;
 	drmModeConnector *connector = NULL;
@@ -236,15 +297,7 @@ int init_drm(struct drm *drm, const char *device, const char *mode_str,
 	}
 
 	/* find a connected connector: */
-	for (i = 0; i < resources->count_connectors; i++) {
-		connector = drmModeGetConnector(drm->fd, resources->connectors[i]);
-		if (connector->connection == DRM_MODE_CONNECTED) {
-			/* it's connected, let's use this! */
-			break;
-		}
-		drmModeFreeConnector(connector);
-		connector = NULL;
-	}
+	connector = find_drm_connector(drm->fd, resources, connector_id);
 
 	if (!connector) {
 		/* we could be fancy and listen for hotplug events and wait for
@@ -305,8 +358,8 @@ int init_drm(struct drm *drm, const char *device, const char *mode_str,
 	if (encoder) {
 		drm->crtc_id = encoder->crtc_id;
 	} else {
-		uint32_t crtc_id = find_crtc_for_connector(drm, resources, connector);
-		if (crtc_id == 0) {
+		int32_t crtc_id = find_crtc_for_connector(drm, resources, connector);
+		if (crtc_id == -1) {
 			printf("no crtc found!\n");
 			return -1;
 		}
@@ -324,6 +377,50 @@ int init_drm(struct drm *drm, const char *device, const char *mode_str,
 	drmModeFreeResources(resources);
 
 	drm->connector_id = connector->connector_id;
+	drm->count = count;
+	drm->nonblocking = nonblocking;
+
+	return 0;
+}
+
+int init_drm_render(struct drm *drm, const char *device, const char *mode_str, unsigned int count)
+{
+	int width, height;
+	drmModeModeInfo *mode;
+
+	if (!mode_str)
+		return -1;
+
+	if (!strnlen(mode_str, DRM_DISPLAY_MODE_LEN)) {
+		printf("Always provide a video mode for offscreen renders, eg: -v 1024x768\n");
+		return -1;
+	}
+
+	if (sscanf(mode_str, "%dx%d", &width, &height) != 2)
+		return -1;
+
+	if (device) {
+		drm->fd = open(device, O_RDWR);
+	} else {
+		drm->fd = find_drm_render_device();
+	}
+
+	if (drm->fd < 0) {
+		printf("could not open drm device\n");
+		return -1;
+	}
+
+	mode = malloc(sizeof(*mode));
+	if (!mode) {
+		close(drm->fd);
+		drm->fd = -1;
+		return -1;
+	}
+
+	mode->hdisplay = width;
+	mode->vdisplay = height;
+	drm->mode = mode;
+
 	drm->count = count;
 
 	return 0;

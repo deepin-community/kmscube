@@ -124,7 +124,10 @@ const struct gbm * init_gbm(int drm_fd, int w, int h, uint32_t format,
 		uint64_t modifier, bool surfaceless)
 {
 	gbm.dev = gbm_create_device(drm_fd);
-	gbm.format = format;
+	if (!gbm.dev)
+		return NULL;
+
+        gbm.format = format;
 	gbm.surface = NULL;
 
 	gbm.width = w;
@@ -250,15 +253,13 @@ create_framebuffer(const struct egl *egl, struct gbm_bo *bo,
 
 	if (egl->modifiers_supported) {
 		const uint64_t modifier = gbm_bo_get_modifier(bo);
-		if (modifier != DRM_FORMAT_MOD_LINEAR) {
-			size_t attrs_index = 12;
-			khr_image_attrs[attrs_index++] =
-			    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
-			khr_image_attrs[attrs_index++] = modifier & 0xfffffffful;
-			khr_image_attrs[attrs_index++] =
-			    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
-			khr_image_attrs[attrs_index++] = modifier >> 32;
-		}
+		size_t attrs_index = 12;
+		khr_image_attrs[attrs_index++] =
+		    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+		khr_image_attrs[attrs_index++] = modifier & 0xfffffffful;
+		khr_image_attrs[attrs_index++] =
+		    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+		khr_image_attrs[attrs_index++] = modifier >> 32;
 	}
 
 	fb->image = egl->eglCreateImageKHR(egl->display, EGL_NO_CONTEXT,
@@ -340,7 +341,7 @@ int init_egl(struct egl *egl, const struct gbm *gbm, int samples)
 		egl->display = egl->eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR,
 				gbm->dev, NULL);
 	} else {
-		egl->display = eglGetDisplay((void *)gbm->dev);
+		egl->display = eglGetDisplay((EGLNativeDisplayType)gbm->dev);
 	}
 
 	if (!eglInitialize(egl->display, &major, &minor)) {
@@ -384,7 +385,7 @@ int init_egl(struct egl *egl, const struct gbm *gbm, int samples)
 
 	egl->context = eglCreateContext(egl->display, egl->config,
 			EGL_NO_CONTEXT, context_attribs);
-	if (egl->context == NULL) {
+	if (egl->context == EGL_NO_CONTEXT) {
 		printf("failed to create context\n");
 		return -1;
 	}
@@ -444,6 +445,10 @@ int create_program(const char *vs_src, const char *fs_src)
 	GLint ret;
 
 	vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+	if (vertex_shader == 0) {
+		printf("vertex shader creation failed!:\n");
+		return -1;
+	}
 
 	glShaderSource(vertex_shader, 1, &vs_src, NULL);
 	glCompileShader(vertex_shader);
@@ -465,7 +470,10 @@ int create_program(const char *vs_src, const char *fs_src)
 	}
 
 	fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-
+	if (fragment_shader == 0) {
+		printf("fragment shader creation failed!:\n");
+		return -1;
+	}
 	glShaderSource(fragment_shader, 1, &fs_src, NULL);
 	glCompileShader(fragment_shader);
 
